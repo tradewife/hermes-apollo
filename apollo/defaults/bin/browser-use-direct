@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PYTHON_BIN="${BROWSER_USE_PYTHON_BIN:-$HOME/.local/share/uv/tools/browser-use/bin/python}"
+
+exec "$PYTHON_BIN" -m browser_use.skill_cli.direct "$@"

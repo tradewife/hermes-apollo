@@ -31,6 +31,8 @@ run_datagen_megascience_glm4-6.sh
 data/*
 node_modules/
 browser-use/
+!apollo/skills/browser-use/
+!apollo/skills/browser-use/**
 agent-browser/
 # Private keys
 *.ppk

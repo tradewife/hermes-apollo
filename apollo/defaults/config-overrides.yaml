@@ -1,0 +1,16 @@
+agent:
+  max_turns: 90
+  reasoning_effort: high
+
+display:
+  personality: technical
+
+skills:
+  creation_nudge_interval: 8
+
+mcp_servers:
+  remotion-documentation:
+    command: npx
+    args:
+      - -y
+      - "@remotion/mcp@latest"
