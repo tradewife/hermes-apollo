@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/banner.png" alt="Hermes Apollo" width="100%">
-</p>
+
 
 # Hermes Apollo
 
