@@ -1694,12 +1694,54 @@ class GatewayRunner:
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
-            context_prompt = (
-                "[System note: The user's previous session expired due to inactivity. "
-                "This is a fresh conversation with no prior context.]\n\n"
-                + context_prompt
-            )
+            reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
+            if reset_reason == "daily":
+                context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
+            else:
+                context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
+            context_prompt = context_note + "\n\n" + context_prompt
+
+            # Send a user-facing notification explaining the reset, unless:
+            # - notifications are disabled in config
+            # - the platform is excluded (e.g. api_server, webhook)
+            # - the expired session had no activity (nothing was cleared)
+            try:
+                policy = self.session_store.config.get_reset_policy(
+                    platform=source.platform,
+                    session_type=getattr(source, 'chat_type', 'dm'),
+                )
+                platform_name = source.platform.value if source.platform else ""
+                had_activity = getattr(session_entry, 'reset_had_activity', False)
+                should_notify = (
+                    policy.notify
+                    and had_activity
+                    and platform_name not in policy.notify_exclude_platforms
+                )
+                if should_notify:
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        if reset_reason == "daily":
+                            reason_text = f"daily schedule at {policy.at_hour}:00"
+                        else:
+                            hours = policy.idle_minutes // 60
+                            mins = policy.idle_minutes % 60
+                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
+                            reason_text = f"inactive for {duration}"
+                        notice = (
+                            f"◐ Session automatically reset ({reason_text}). "
+                            f"Conversation history cleared.\n"
+                            f"Use /resume to browse and restore a previous session.\n"
+                            f"Adjust reset timing in config.yaml under session_reset."
+                        )
+                        await adapter.send(
+                            source.chat_id, notice,
+                            metadata=getattr(event, 'metadata', None),
+                        )
+            except Exception as e:
+                logger.debug("Auto-reset notification failed (non-fatal): %s", e)
+
             session_entry.was_auto_reset = False
+            session_entry.auto_reset_reason = None
         
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
@@ -1715,9 +1757,9 @@ class GatewayRunner:
         # Token source priority:
         # 1. Actual API-reported prompt_tokens from the last turn
         #    (stored in session_entry.last_prompt_tokens)
-        # 2. Rough char-based estimate (str(msg)//4) with a 1.4x
-        #    safety factor to account for overestimation on tool-heavy
-        #    conversations (code/JSON tokenizes at 5-7+ chars/token).
+        # 2. Rough char-based estimate (str(msg)//4). Overestimates
+        #    by 30-50% on code/JSON-heavy sessions, but that just
+        #    means hygiene fires a bit early — safe and harmless.
         # -----------------------------------------------------------------
         if history and len(history) >= 4:
             from agent.model_metadata import (
@@ -1736,6 +1778,10 @@ class GatewayRunner:
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
+            _hyg_config_context_length = None
+            _hyg_provider = None
+            _hyg_base_url = None
+            _hyg_api_key = None
             try:
                 _hyg_cfg_path = _hermes_home / "config.yaml"
                 if _hyg_cfg_path.exists():
@@ -1749,6 +1795,17 @@ class GatewayRunner:
                         _hyg_model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         _hyg_model = _model_cfg.get("default", _hyg_model)
+                        # Read explicit context_length override from model config
+                        # (same as run_agent.py lines 995-1005)
+                        _raw_ctx = _model_cfg.get("context_length")
+                        if _raw_ctx is not None:
+                            try:
+                                _hyg_config_context_length = int(_raw_ctx)
+                            except (TypeError, ValueError):
+                                pass
+                        # Read provider for accurate context detection
+                        _hyg_provider = _model_cfg.get("provider") or None
+                        _hyg_base_url = _model_cfg.get("base_url") or None
 
                     # Read compression settings — only use enabled flag.
                     # The threshold is intentionally separate from the agent's
@@ -1758,11 +1815,27 @@ class GatewayRunner:
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in ("true", "1", "yes")
+
+                # Resolve provider/base_url from runtime if not in config
+                if not _hyg_provider or not _hyg_base_url:
+                    try:
+                        _hyg_runtime = _resolve_runtime_agent_kwargs()
+                        _hyg_provider = _hyg_provider or _hyg_runtime.get("provider")
+                        _hyg_base_url = _hyg_base_url or _hyg_runtime.get("base_url")
+                        _hyg_api_key = _hyg_runtime.get("api_key")
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
             if _hyg_compression_enabled:
-                _hyg_context_length = get_model_context_length(_hyg_model)
+                _hyg_context_length = get_model_context_length(
+                    _hyg_model,
+                    base_url=_hyg_base_url or "",
+                    api_key=_hyg_api_key or "",
+                    config_context_length=_hyg_config_context_length,
+                    provider=_hyg_provider or "",
+                )
                 _compress_token_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct
                 )
@@ -1772,20 +1845,20 @@ class GatewayRunner:
 
                 # Prefer actual API-reported tokens from the last turn
                 # (stored in session entry) over the rough char-based estimate.
-                # The rough estimate (str(msg)//4) overestimates by 30-50% on
-                # tool-heavy/code-heavy conversations, causing premature compression.
                 _stored_tokens = session_entry.last_prompt_tokens
                 if _stored_tokens > 0:
                     _approx_tokens = _stored_tokens
                     _token_source = "actual"
                 else:
                     _approx_tokens = estimate_messages_tokens_rough(history)
-                    # Apply safety factor only for rough estimates
-                    _compress_token_threshold = int(
-                        _compress_token_threshold * 1.4
-                    )
-                    _warn_token_threshold = int(_warn_token_threshold * 1.4)
                     _token_source = "estimated"
+                    # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
+                    # sessions, but that just means hygiene fires a bit early — which
+                    # is safe and harmless.  The 85% threshold already provides ample
+                    # headroom (agent's own compressor runs at 50%).  A previous 1.4x
+                    # multiplier tried to compensate by inflating the threshold, but
+                    # 85% * 1.4 = 119% of context — which exceeds the model's limit
+                    # and prevented hygiene from ever firing for ~200K models (GLM-5).
 
                 _needs_compress = _approx_tokens >= _compress_token_threshold
 
@@ -2125,7 +2198,15 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key
             )
-            
+
+            # Stop persistent typing indicator now that the agent is done
+            try:
+                _typing_adapter = self.adapters.get(source.platform)
+                if _typing_adapter and hasattr(_typing_adapter, "stop_typing"):
+                    await _typing_adapter.stop_typing(source.chat_id)
+            except Exception:
+                pass
+
             response = agent_result.get("final_response") or ""
             agent_messages = agent_result.get("messages", [])
 
@@ -2317,14 +2398,23 @@ class GatewayRunner:
             # delivered without this.
             if agent_result.get("already_sent"):
                 if response:
-                    await self._deliver_media_from_response(
-                        response, event, adapter,
-                    )
+                    _media_adapter = self.adapters.get(source.platform)
+                    if _media_adapter:
+                        await self._deliver_media_from_response(
+                            response, event, _media_adapter,
+                        )
                 return None
 
             return response
             
         except Exception as e:
+            # Stop typing indicator on error too
+            try:
+                _err_adapter = self.adapters.get(source.platform)
+                if _err_adapter and hasattr(_err_adapter, "stop_typing"):
+                    await _err_adapter.stop_typing(source.chat_id)
+            except Exception:
+                pass
             logger.exception("Agent error in session %s", session_key)
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
@@ -5209,22 +5299,31 @@ class GatewayRunner:
                     self._effective_model = None
                     self._effective_provider = None
 
-            # Check if we were interrupted and have a pending message
+            # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
             adapter = self.adapters.get(source.platform)
             
-            # Get pending message from adapter if interrupted.
+            # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending = None
-            if result and result.get("interrupted") and adapter:
-                pending_event = adapter.get_pending_message(session_key) if session_key else None
-                if pending_event:
-                    pending = pending_event.text
-                elif result.get("interrupt_message"):
-                    pending = result.get("interrupt_message")
+            if result and adapter and session_key:
+                if result.get("interrupted"):
+                    # Interrupted — consume the interrupt message
+                    pending_event = adapter.get_pending_message(session_key)
+                    if pending_event:
+                        pending = pending_event.text
+                    elif result.get("interrupt_message"):
+                        pending = result.get("interrupt_message")
+                else:
+                    # Normal completion — check for /queue'd messages that were
+                    # stored without triggering an interrupt.
+                    pending_event = adapter.get_pending_message(session_key)
+                    if pending_event:
+                        pending = pending_event.text
+                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
             
             if pending:
-                logger.debug("Processing interrupted message: '%s...'", pending[:40])
+                logger.debug("Processing pending message: '%s...'", pending[:40])
                 
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
@@ -5246,11 +5345,25 @@ class GatewayRunner:
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
-                # Don't send the interrupted response to the user — it's just noise
-                # like "Operation interrupted." They already know they sent a new
-                # message, so go straight to processing it.
-                
-                # Now process the pending message with updated history
+                was_interrupted = result.get("interrupted")
+                if not was_interrupted:
+                    # Queued message after normal completion — deliver the first
+                    # response before processing the queued follow-up.
+                    # Skip if streaming already delivered it.
+                    _sc = stream_consumer_holder[0]
+                    _already_streamed = _sc and getattr(_sc, "already_sent", False)
+                    first_response = result.get("final_response", "")
+                    if first_response and not _already_streamed:
+                        try:
+                            await adapter.send(source.chat_id, first_response,
+                                               metadata=getattr(event, "metadata", None))
+                        except Exception as e:
+                            logger.warning("Failed to send first response before queued message: %s", e)
+                # else: interrupted — discard the interrupted response ("Operation
+                # interrupted." is just noise; the user already knows they sent a
+                # new message).
+
+                # Process the pending message with updated history
                 updated_history = result.get("messages", history)
                 return await self._run_agent(
                     message=pending,
@@ -5408,6 +5521,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 except (ProcessLookupError, PermissionError):
                     pass
             remove_pid_file()
+            # Also release all scoped locks left by the old process.
+            # Stopped (Ctrl+Z) processes don't release locks on exit,
+            # leaving stale lock files that block the new gateway from starting.
+            try:
+                from gateway.status import release_all_scoped_locks
+                _released = release_all_scoped_locks()
+                if _released:
+                    logger.info("Released %d stale scoped lock(s) from old gateway.", _released)
+            except Exception:
+                pass
         else:
             hermes_home = os.getenv("HERMES_HOME", "~/.hermes")
             logger.error(
