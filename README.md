@@ -36,6 +36,8 @@ The Apollo-specific files live here:
 apollo/
   defaults/
     SOUL.md
+    MEMORY.md (seeded into memories/ on fresh install)
+    oracle-prompt.md
     config-overrides.yaml
     bin/browser-use-direct
   skills/
@@ -63,9 +65,11 @@ That installs Apollo defaults into `~/.hermes`.
 `scripts/install-apollo.sh` does the following:
 
 - writes `~/.hermes/SOUL.md`
+- writes `~/.hermes/oracle-prompt.md`
 - deep-merges Apollo config overrides into `~/.hermes/config.yaml`
 - copies Apollo skills into `~/.hermes/skills`
 - installs `~/.hermes/bin/browser-use-direct`
+- seeds `~/.hermes/memories/MEMORY.md` (fresh installs only; never overwrites existing)
 
 ## What The Installer Does Not Touch
 
