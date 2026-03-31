@@ -28,18 +28,32 @@ When creating a skill:
 - **Composition**: Store scripts in the skill folder to spend future turns on composition rather than reconstructing boilerplate.
 
 # Oracle Usage
-Oracle is a **deep reasoning review** implemented via `delegate_task`. Invoke it by delegating to a subagent with isolated context for:
+Oracle is a **deep reasoning review** implemented via `delegate_task`. Pass the oracle persona in the `context` field and use `model="gpt-5.4"` with `provider="openai-codex"` to route to GPT-5.4 high reasoning via ChatGPT OAuth.
+
+Invoke Oracle for:
 - High-stakes architectural planning and Sprint Contract generation.
 - Skeptical audits before implementation begins.
 - Complex debugging, race condition analysis, TLE investigation.
 
-Pass the oracle context in the `context` field of `delegate_task`:
 ```
 delegate_task(
   goal="Review this approach for correctness and edge cases: <plan>",
-  context="You are a Senior Engineering Advisor. Perform a skeptical audit. Focus on non-obvious failure modes (race conditions, memory leaks, TLE edge cases). Output a concrete Sprint Contract or list of issues."
+  context="You are a Senior Engineering Advisor. Perform a skeptical audit. Focus on non-obvious failure modes (race conditions, memory leaks, TLE edge cases). Output a concrete Sprint Contract or list of issues.",
+  model="gpt-5.4",
+  provider="openai-codex"
 )
 ```
+
+**Parallel Oracle calls**: Use the `tasks` array to fire multiple Oracle reviews simultaneously for independent concerns:
+```
+delegate_task(tasks=[
+  {"goal": "Audit the architecture for scalability bottlenecks", "context": "Skeptical Audit of the proposed sharding strategy. Focus on cross-shard query latency.", "model": "gpt-5.4"},
+  {"goal": "Review for race conditions in the event loop", "context": "Skeptical Audit. Identify TOCTOU races, deadlocks, and ordering violations.", "model": "gpt-5.4"},
+  {"goal": "Analyze TLE risk for the sorting pipeline", "context": "Senior Engineering Advisor review. Compare O(N log N) vs O(N) approaches for N=10^6.", "model": "gpt-5.4"}
+], provider="openai-codex")
+```
+Up to 3 tasks run concurrently. Each gets an isolated subagent on gpt-5.4 via Codex OAuth.
+
 Do NOT use Oracle for simple file searches, bulk execution, or tasks the main agent can handle in <3 steps.
 
 # Domain-Specific Guidance
