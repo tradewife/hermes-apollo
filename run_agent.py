@@ -3594,6 +3594,20 @@ class AIAgent:
         if normalized in self.valid_tool_names:
             return normalized
 
+        # 2.5. Detect doubled/repeated tool names (e.g. "read_fileread_file",
+        # "execute_codeexecute_code", "terminalterminal...") — some models
+        # emit the name twice. Try halving and checking each candidate.
+        if len(normalized) > 4:
+            mid = len(normalized) // 2
+            for candidate in (normalized[:mid], normalized[mid:]):
+                if candidate in self.valid_tool_names:
+                    return candidate
+            # Also try incremental splits for n-fold repeats
+            for chunk_len in range(3, len(normalized) // 2 + 1):
+                candidate = normalized[:chunk_len]
+                if candidate in self.valid_tool_names:
+                    return candidate
+
         # 3. Fuzzy match
         matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
         if matches:
