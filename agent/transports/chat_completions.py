@@ -188,6 +188,11 @@ class ChatCompletionsTransport(ProviderTransport):
         is_nvidia_nim = params.get("is_nvidia_nim", False)
         is_kimi = params.get("is_kimi", False)
         reasoning_config = params.get("reasoning_config")
+        _is_custom = params.get("is_custom_provider", False)
+
+        import logging as _log
+        _l = _log.getLogger("agent.transports.chat_completions")
+        _l.info("TRANSPORT DEBUG: is_kimi=%s is_custom=%s reasoning_config=%s model=%s", is_kimi, _is_custom, reasoning_config, params.get("model_lower"))
 
         if ephemeral is not None and max_tokens_fn:
             api_kwargs.update(max_tokens_fn(ephemeral))
@@ -238,6 +243,20 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body["thinking"] = {
                 "type": "enabled" if _kimi_thinking_enabled else "disabled",
             }
+        # Z.AI uses the same `thinking` param as Kimi
+        if not is_kimi and params.get("is_custom_provider", False):
+            _zai_thinking_enabled = True
+            if reasoning_config and isinstance(reasoning_config, dict):
+                if reasoning_config.get("enabled") is False:
+                    _zai_thinking_enabled = False
+            extra_body["thinking"] = {
+                "type": "enabled" if _zai_thinking_enabled else "disabled",
+            }
+            import logging as _log
+            _log.getLogger("agent.transports.chat_completions").info(
+                "Z.AI custom provider: thinking=%s, reasoning_config=%s",
+                extra_body["thinking"], reasoning_config,
+            )
 
         # Reasoning
         if params.get("supports_reasoning", False):
